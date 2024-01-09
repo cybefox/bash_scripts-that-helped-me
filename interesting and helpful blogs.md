@@ -1,0 +1,5 @@
+- https://networkwizkid.com/enabling-remote-access-of-parrot-security-os/
+- https://phoenixnap.com/kb/ubuntu-remote-desktop-from-mac
+- https://docs.e2enetworks.com/guides/ubuntu_xrdp.html
+- https://www.digitalocean.com/community/tutorials/how-to-enable-remote-desktop-protocol-using-xrdp-on-ubuntu-22-04
+- 
