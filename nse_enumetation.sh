@@ -31,7 +31,7 @@ echo "[*] Starting initial scan on $TARGET..."
 # -T4 : Faster timing template; adjust if you need stealth
 # -oG : Grepable output, easier to parse
 # -p- : Scan all 65535 TCP ports (you can limit to top ports if you wish)
-nmap -sV -T4 -p- -oG initial_scan.grep "$TARGET"
+nmap -sV -T4 -p- -vv -oG initial_scan.grep "$TARGET"
 
 echo "[*] Parsing open ports from initial scan..."
 
@@ -69,7 +69,7 @@ echo "[*] Running NSE scripts on open ports..."
 #   - auth, brute, discovery, etc.
 #
 # Here we run "default,vuln" for demonstration. Feel free to adjust.
-nmap -sV -p "$OPEN_PORTS" \
+nmap -sV -vv -p "$OPEN_PORTS" \
      --script=default,vuln \
      -oN nse_scan_results.txt \
      "$TARGET"
