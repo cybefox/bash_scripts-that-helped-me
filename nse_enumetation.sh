@@ -44,9 +44,9 @@ echo "[*] Parsing open ports from initial scan..."
 OPEN_PORTS=$(grep -i "Ports:" initial_scan.grep | \
   awk -F 'Ports: ' '{print $2}' | \
   awk -F 'Ignored ' '{print $1}' | \
-  sed 's/, /,/g' | tr ' ' '\n' | \
+  tr ',' '\n' | \
   grep open | \
-  cut -d '/' -f1 | \
+  cut -d '/' -f1 | tr -d ' ' | \
   tr '\n' ',' | sed 's/,$//')
 
 if [ -z "$OPEN_PORTS" ]; then
