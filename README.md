@@ -6,7 +6,10 @@
    ```bash
    for ip in $(ipset list oldset | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'); do ipset add newset $ip; done
    ```
-
+2. the one that helps me get basic info of internal networks without sending heavy packets using nmap
+   ```bash
+   sudo nmap -sS -p 22,80,443,445,3389 --open --max-retries 1 --vv --min-rate 50 -T2 -iL internal_ip.txt -oN Internal_nmap_output
+   ```
 
 ## files
 
