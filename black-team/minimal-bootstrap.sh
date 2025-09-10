@@ -1,304 +1,139 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Minimal Black-Team Toolkit Bootstrap (stealth dropbox)
+# Visual + Secure edition
+
+set -Eeuo pipefail
 IFS=$'\n\t'
-set -x
+umask 027
 
-# ==============================
-# Black Team / APT-Sim Bootstrap
-# Tested on Kali (Debian-based)
-# ==============================
+# -------- Visuals --------
+if command -v tput >/dev/null 2>&1 && [ -n "${TERM:-}" ]; then
+  B=$(tput bold); R=$(tput setaf 1); G=$(tput setaf 2); Y=$(tput setaf 3); C=$(tput setaf 6); N=$(tput sgr0)
+else B=""; R=""; G=""; Y=""; C=""; N=""; fi
+ok(){ echo -e "${G}✔${N} $*"; }
+warn(){ echo -e "${Y}⚠${N} $*" >&2; }
+err(){ echo -e "${R}✘${N} $*" >&2; }
+info(){ echo -e "${C}➜${N} $*"; }
+title(){ echo -e "\n${B}${C}▞▞ $* ▚▚${N}\n"; }
 
-# ---- Config / Layout ----
+# -------- Safety/Context --------
+[ "${EUID}" -eq 0 ] || { err "Run as root (sudo)."; exit 1; }
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+LOG="/tmp/blackteam-minimal-$(date +%Y%m%d-%H%M%S).log"
+exec > >(tee -a "$LOG") 2>&1
+
 ROOT_DIR="/opt/blackteam"
 BIN_DIR="/usr/local/bin"
-TMP_DIR="/tmp/blackteam-tmp"
-mkdir -p "$ROOT_DIR" "$TMP_DIR"
+TMP_DIR="$(mktemp -d -t blackteam-min-XXXXXX)"
+trap 'rc=$?; rm -rf "$TMP_DIR"; [ $rc -eq 0 ] && ok "Cleanup done." || err "Exited with status $rc"; exit $rc' EXIT INT TERM
 
-# Versions for direct-download binaries (adjust if needed)
-CHISEL_VER="1.9.1"
-LIGOLO_VER="0.6.3"
-GOST_VER="2.11.5"
-SLIVER_VER="1.5.39"   # binary convenience; you can update later
+set -x  # verbose
 
-# ---- Helpers ----
-is_installed() { dpkg -s "$1" >/dev/null 2>&1; }
-has_cmd() { command -v "$1" >/dev/null 2>&1; }
-ensure_link() {
-  # ensure_link <target> <symlink>
-  local target="$1" link="$2"
-  if [[ -x "$target" ]]; then
-    sudo ln -sf "$target" "$link"
-  else
-    echo "[warn] not executable: $target"
-  fi
+# -------- Helpers --------
+has(){ command -v "$1" >/dev/null 2>&1; }
+is_installed(){ dpkg -s "$1" >/dev/null 2>&1 || rpm -q "$1" >/dev/null 2>&1 || return 1; }
+apt_update(){ has apt-get && apt-get update -y || warn "apt update failed (continuing)"; }
+apt_install(){ local p="$1"; has apt-get || { warn "apt missing; skip $p"; return; }
+  is_installed "$p" && { info "$p already installed"; return; }
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" || warn "apt failed for $p (skip)"
 }
-ensure_path_msg='
-If you installed pipx for the first time, you may need to re-login OR:
-  export PATH="$HOME/.local/bin:$PATH"
-'
-
-apt_update_once() {
-  if [[ ! -f /var/lib/apt/periodic/update-success-stamp ]] || \
-     [[ $(find /var/lib/apt/periodic/update-success-stamp -mmin +60 -print -quit) ]]; then
-    sudo apt-get update -y
-  fi
+fetch(){ # fetch <url> <out>
+  local u="$1" o="$2"
+  if has curl; then
+    curl --proto '=https' --tlsv1.2 -fsSLo "$o" "$u" || { warn "curl failed $u"; return 1; }
+  elif has wget; then
+    wget --https-only -qO "$o" "$u" || { warn "wget failed $u"; return 1; }
+  else warn "no curl/wget available"; return 1; fi
+}
+link_bin(){ local t="$1" l="$2"; [ -x "$t" ] && ln -sf "$t" "$l" || warn "not executable: $t"; }
+git_clone(){ # git_clone <url> <dir>
+  has git || { warn "git missing; cannot clone $1"; return; }
+  if [ -d "$2/.git" ]; then (cd "$2" && git pull --ff-only) || warn "git pull failed: $2"
+  else git clone --depth 1 "$1" "$2" || warn "git clone failed: $1"; fi
 }
 
-# ---- APT base tools ----
-APT_PKGS=(
-  # Recon & Discovery
-  nmap masscan dnsrecon dnsutils whois
-  # LDAP / Kerberos / AD helpers
-  ldap-utils kerbrute
-  # BloodHound GUI + Neo4j
-  bloodhound neo4j
-  # Creds & Auth
-  crackmapexec responder hashcat john smbmap evil-winrm
-  # mitm6, wireshark, iodine (tunneling)
-  mitm6 wireshark iodine
-  # Build/utility
-  git wget curl jq unzip xz-utils python3-venv python3-pip
-)
+# -------- Layout --------
+mkdir -p "$ROOT_DIR" "$BIN_DIR"
 
-echo "[*] Installing APT packages (skipping already-installed)..."
-apt_update_once
-for pkg in "${APT_PKGS[@]}"; do
-  if is_installed "$pkg"; then
-    echo "[=] $pkg already installed, skipping."
-  else
-    sudo apt-get install -y "$pkg"
-  fi
+title "Group 0 • Base packages"
+apt_update
+for p in nmap masscan dnsrecon dnsutils whois ldap-utils bloodhound neo4j \
+         crackmapexec responder hashcat john smbmap evil-winrm mitm6 wireshark iodine \
+         git wget curl jq unzip xz-utils python3-venv python3-pip; do
+  apt_install "$p"
 done
+ok "Base packages processed."
 
-# ---- pipx (Python app runner) ----
-if ! has_cmd pipx; then
-  python3 -m pip install --user pipx
-  python3 -m pipx ensurepath || true
-  echo "$ensure_path_msg"
+title "Group 1 • Python CLIs via pipx"
+if ! has pipx; then
+  if has python3; then
+    su - "${SUDO_USER:-root}" -c "python3 -m pip install --user pipx" || warn "pipx install failed"
+    su - "${SUDO_USER:-root}" -c "python3 -m pipx ensurepath" || true
+  else warn "python3 missing; skipping pipx"; fi
 fi
-
-# Ensure pipx works with sudo (we’ll call pipx as the current user)
-if ! has_cmd pipx; then
-  echo "[!] pipx not on PATH yet. Exporting PATH for this session."
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-
-# ---- Python CLI (pipx) ----
-PIPX_TOOLS=(
-  impacket
-  coercer
-  bloodhound-python
-  lsassy
-  pypykatz
-)
-
-echo "[*] Installing Python-based tools via pipx..."
-for tool in "${PIPX_TOOLS[@]}"; do
-  if pipx list 2>/dev/null | grep -qiE "package $tool "; then
-    echo "[=] pipx $tool already installed."
-  else
-    pipx install "$tool"
+export PATH="/home/${SUDO_USER:-root}/.local/bin:$PATH"
+pipx_install(){ local pkg="$1"
+  if has pipx; then
+    pipx list 2>/dev/null | grep -qiE "package ${pkg} " && info "pipx $pkg already installed" || \
+    pipx install "$pkg" || warn "pipx failed for $pkg (skip)"
   fi
-done
-
-# Symlink pipx binaries into /usr/local/bin (so root shells find them)
-PIPX_BIN="$HOME/.local/bin"
+}
+pipx_install impacket
+pipx_install coercer
+pipx_install bloodhound-python
+pipx_install lsassy
+pipx_install pypykatz
 for exe in impacket-* bloodhound-python coercer lsassy pypykatz; do
-  if [[ -x "$PIPX_BIN/$exe" ]]; then
-    sudo ln -sf "$PIPX_BIN/$exe" "$BIN_DIR/$exe"
-  fi
+  [ -x "/home/${SUDO_USER:-root}/.local/bin/$exe" ] && link_bin "/home/${SUDO_USER:-root}/.local/bin/$exe" "$BIN_DIR/$exe"
 done
+ok "Python tools ready."
 
-# ==============================
-# GROUP 1: Recon & Discovery
-# ==============================
-mkdir -p "$ROOT_DIR/recon"
-pushd "$ROOT_DIR/recon" >/dev/null
-
-# amass / subfinder / assetfinder via snap/go can be heavy; clone light OSINT helpers:
-if [[ ! -d Maltego-note ]]; then
-  echo "[i] (Optional) Maltego is GUI/proprietary; skip auto-install."
-  mkdir -p Maltego-note && echo "Download Maltego manually if needed." > Maltego-note/README.txt
-fi
-
-popd >/dev/null
-
-# ==============================
-# GROUP 2: Credentials & Auth
-# (impacket / cme installed above)
-# ==============================
-mkdir -p "$ROOT_DIR/creds"
-pushd "$ROOT_DIR/creds" >/dev/null
-
-# gpp-decrypt included with Kali (in kali-defaults), else we fetch a small helper:
-if [[ ! -f gpp-decrypt.py ]]; then
-  wget -qO gpp-decrypt.py https://raw.githubusercontent.com/t0thkr1s/gpp-decrypt/master/gpp-decrypt.py || true
-  chmod +x gpp-decrypt.py || true
-  ensure_link "$ROOT_DIR/creds/gpp-decrypt.py" "$BIN_DIR/gpp-decrypt"
-fi
-popd >/dev/null
-
-# ==============================
-# GROUP 3: Coercion & Relaying
-# (responder, mitm6, coercer installed)
-# ==============================
+title "Group 2 • Coercion & Relaying"
 mkdir -p "$ROOT_DIR/coerce"
-pushd "$ROOT_DIR/coerce" >/dev/null
+git_clone https://github.com/topotam/PetitPotam.git "$ROOT_DIR/coerce/PetitPotam"
+link_bin "$ROOT_DIR/coerce/PetitPotam/petitpotam.py" "$BIN_DIR/petitpotam.py"
+git_clone https://github.com/dirkjanm/krbrelayx.git "$ROOT_DIR/coerce/krbrelayx"
+link_bin "$ROOT_DIR/coerce/krbrelayx/printerbug.py" "$BIN_DIR/printerbug.py"
+ok "Coercion utilities staged."
 
-# PetitPotam
-if [[ ! -d PetitPotam ]]; then
-  git clone https://github.com/topotam/PetitPotam.git
-fi
-ensure_link "$ROOT_DIR/coerce/PetitPotam/petitpotam.py" "$BIN_DIR/petitpotam.py"
-
-# krbrelayx (contains printerbug.py and more)
-if [[ ! -d krbrelayx ]]; then
-  git clone https://github.com/dirkjanm/krbrelayx.git
-else
-  pushd krbrelayx >/dev/null && git pull --ff-only || true; popd >/dev/null
-fi
-ensure_link "$ROOT_DIR/coerce/krbrelayx/printerbug.py" "$BIN_DIR/printerbug.py"
-
-popd >/dev/null
-
-# ==============================
-# GROUP 4: Priv Esc & Lateral
-# (evil-winrm, smbmap, lsassy, pypykatz installed)
-# ==============================
-mkdir -p "$ROOT_DIR/privmove"
-pushd "$ROOT_DIR/privmove" >/dev/null
-# Nothing extra here; core tools are already installed & linked.
-popd >/dev/null
-
-# ==============================
-# GROUP 5: Stealth / Tradecraft
-# ==============================
+title "Group 3 • Stealth / Pivot (chisel, ligolo-ng, gost)"
 mkdir -p "$ROOT_DIR/stealth"
-pushd "$ROOT_DIR/stealth" >/dev/null
+ARCH="$(uname -m)"; CARCH="amd64"; [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ] && CARCH="arm64"
 
-# dnscat2
-if [[ ! -d dnscat2 ]]; then
-  git clone https://github.com/iagox86/dnscat2.git
-else
-  pushd dnscat2 >/dev/null && git pull --ff-only || true; popd >/dev-null || true
+# chisel
+CHISEL_VER="1.9.1"
+if [ ! -x "$ROOT_DIR/stealth/chisel" ]; then
+  if fetch "https://github.com/jpillora/chisel/releases/download/v${CHISEL_VER}/chisel_${CHISEL_VER}_linux_${CARCH}.gz" "$TMP_DIR/chisel.gz"; then
+    gunzip -f "$TMP_DIR/chisel.gz" || warn "gunzip chisel failed"
+    mv "$TMP_DIR/chisel_${CHISEL_VER}_linux_${CARCH}" "$ROOT_DIR/stealth/chisel" 2>/dev/null || true
+    chmod +x "$ROOT_DIR/stealth/chisel" 2>/dev/null || true
+  fi
 fi
+link_bin "$ROOT_DIR/stealth/chisel" "$BIN_DIR/chisel"
 
-# chisel (prebuilt)
-ARCH=$(uname -m)
-case "$ARCH" in
-  x86_64|amd64) CHISEL_ARCH="amd64" ;;
-  aarch64|arm64) CHISEL_ARCH="arm64" ;;
-  *) CHISEL_ARCH="amd64" ;;
-esac
-if [[ ! -x "$ROOT_DIR/stealth/chisel" ]]; then
-  wget -O "$TMP_DIR/chisel.gz" "https://github.com/jpillora/chisel/releases/download/v${CHISEL_VER}/chisel_${CHISEL_VER}_linux_${CHISEL_ARCH}.gz"
-  gunzip -f "$TMP_DIR/chisel.gz"
-  mv "$TMP_DIR/chisel_${CHISEL_VER}_linux_${CHISEL_ARCH}" "$ROOT_DIR/stealth/chisel"
-  chmod +x "$ROOT_DIR/stealth/chisel"
+# ligolo-ng
+LIGOLO_VER="0.6.3"; LARCH="linux-amd64"; [ "$CARCH" = "arm64" ] && LARCH="linux-arm64"
+if [ ! -x "$ROOT_DIR/stealth/ligolo-proxy" ] || [ ! -x "$ROOT_DIR/stealth/ligolo-agent" ]; then
+  if fetch "https://github.com/nicocha30/ligolo-ng/releases/download/v${LIGOLO_VER}/ligolo-ng_${LIGOLO_VER}_${LARCH}.zip" "$TMP_DIR/ligolo.zip"; then
+    unzip -o "$TMP_DIR/ligolo.zip" -d "$ROOT_DIR/stealth" || warn "unzip ligolo failed"
+    chmod +x "$ROOT_DIR/stealth/ligolo-"* 2>/dev/null || true
+  fi
 fi
-ensure_link "$ROOT_DIR/stealth/chisel" "$BIN_DIR/chisel"
+link_bin "$ROOT_DIR/stealth/ligolo-proxy" "$BIN_DIR/ligolo-proxy"
+link_bin "$ROOT_DIR/stealth/ligolo-agent" "$BIN_DIR/ligolo-agent"
 
-# ligolo-ng (prebuilt agent/proxy)
-if [[ ! -x "$ROOT_DIR/stealth/ligolo-proxy" || ! -x "$ROOT_DIR/stealth/ligolo-agent" ]]; then
-  case "$ARCH" in
-    x86_64|amd64) LIGOLO_ARCH="linux-amd64" ;;
-    aarch64|arm64) LIGOLO_ARCH="linux-arm64" ;;
-    *) LIGOLO_ARCH="linux-amd64" ;;
-  esac
-  wget -O "$TMP_DIR/ligolo.zip" "https://github.com/nicocha30/ligolo-ng/releases/download/v${LIGOLO_VER}/ligolo-ng_${LIGOLO_VER}_${LIGOLO_ARCH}.zip"
-  unzip -o "$TMP_DIR/ligolo.zip" -d "$ROOT_DIR/stealth"
-  chmod +x "$ROOT_DIR/stealth/ligolo-*"
+# gost
+GOST_VER="2.11.5"; GARCH="linux-amd64"; [ "$CARCH" = "arm64" ] && GARCH="linux-arm64"
+if [ ! -x "$ROOT_DIR/stealth/gost" ]; then
+  if fetch "https://github.com/go-gost/gost/releases/download/v${GOST_VER}/gost_${GOST_VER}_${GARCH}.tar.gz" "$TMP_DIR/gost.tgz"; then
+    tar -xzf "$TMP_DIR/gost.tgz" -C "$TMP_DIR" || warn "tar gost failed"
+    find "$TMP_DIR" -type f -name gost -exec mv {} "$ROOT_DIR/stealth/gost" \; 2>/dev/null || true
+    chmod +x "$ROOT_DIR/stealth/gost" 2>/dev/null || true
+  fi
 fi
-ensure_link "$ROOT_DIR/stealth/ligolo-proxy" "$BIN_DIR/ligolo-proxy"
-ensure_link "$ROOT_DIR/stealth/ligolo-agent" "$BIN_DIR/ligolo-agent"
+link_bin "$ROOT_DIR/stealth/gost" "$BIN_DIR/gost"
+ok "Stealth tooling ready."
 
-# gost (stealth proxy)
-if [[ ! -x "$ROOT_DIR/stealth/gost" ]]; then
-  case "$ARCH" in
-    x86_64|amd64) GOST_ARCH="linux-amd64" ;;
-    aarch64|arm64) GOST_ARCH="linux-arm64" ;;
-    *) GOST_ARCH="linux-amd64" ;;
-  esac
-  wget -O "$TMP_DIR/gost.tar.gz" "https://github.com/go-gost/gost/releases/download/v${GOST_VER}/gost_${GOST_VER}_${GOST_ARCH}.tar.gz"
-  tar -xzf "$TMP_DIR/gost.tar.gz" -C "$TMP_DIR"
-  find "$TMP_DIR" -maxdepth 2 -type f -name gost -exec mv {} "$ROOT_DIR/stealth/gost" \;
-  chmod +x "$ROOT_DIR/stealth/gost"
-fi
-ensure_link "$ROOT_DIR/stealth/gost" "$BIN_DIR/gost"
-
-popd >/dev/null
-
-# ==============================
-# GROUP 6: C2 & Evasion
-# ==============================
-mkdir -p "$ROOT_DIR/c2"
-pushd "$ROOT_DIR/c2" >/dev/null
-
-# Sliver (prebuilt)
-if [[ ! -x "$ROOT_DIR/c2/sliver-server" ]]; then
-  case "$ARCH" in
-    x86_64|amd64) SLIVER_ARCH="linux" ;;
-    aarch64|arm64) SLIVER_ARCH="linux-arm64" ;;
-    *) SLIVER_ARCH="linux" ;;
-  esac
-  wget -O "$TMP_DIR/sliver.zip" "https://github.com/BishopFox/sliver/releases/download/v${SLIVER_VER}/sliver-server_${SLIVER_ARCH}.zip" || true
-  wget -O "$TMP_DIR/sliver-client.zip" "https://github.com/BishopFox/sliver/releases/download/v${SLIVER_VER}/sliver-client_${SLIVER_ARCH}.zip" || true
-  if [[ -f "$TMP_DIR/sliver.zip" ]]; then unzip -o "$TMP_DIR/sliver.zip" -d "$ROOT_DIR/c2"; fi
-  if [[ -f "$TMP_DIR/sliver-client.zip" ]]; then unzip -o "$TMP_DIR/sliver-client.zip" -d "$ROOT_DIR/c2"; fi
-  chmod +x "$ROOT_DIR/c2/"sliver-*
-fi
-ensure_link "$ROOT_DIR/c2/sliver-server" "$BIN_DIR/sliver-server" || true
-ensure_link "$ROOT_DIR/c2/sliver-client" "$BIN_DIR/sliver-client" || true
-
-# Havoc (clone only; build manually if you want)
-if [[ ! -d Havoc ]]; then
-  git clone https://github.com/HavocFramework/Havoc.git
-else
-  pushd Havoc >/dev/null && git pull --ff-only || true; popd >/dev/null
-fi
-
-# Mythic (clone; dockerized—skip auto install in this script)
-if [[ ! -d mythic ]]; then
-  git clone https://github.com/its-a-feature/Mythic.git mythic
-else
-  pushd mythic >/dev/null && git pull --ff-only || true; popd >/dev/null
-fi
-
-popd >/dev/null
-
-# ==============================
-# GROUP 7: GUI / Viz / Reporting
-# ==============================
-mkdir -p "$ROOT_DIR/gui"
-pushd "$ROOT_DIR/gui" >/dev/null
-# BloodHound GUI installed via apt; PingCastle is Windows (run from a Windows jump host).
-# GoPhish (optional download)
-if [[ ! -d gophish ]]; then
-  echo "[i] (Optional) Download GoPhish manually or add a fixed version URL here."
-fi
-popd >/dev/null
-
-# ---- Symlink a few notable scripts from repos ----
-ensure_link "$ROOT_DIR/coerce/PetitPotam/petitpotam.py" "$BIN_DIR/petitpotam.py"
-ensure_link "$ROOT_DIR/coerce/krbrelayx/printerbug.py" "$BIN_DIR/printerbug.py"
-
-# ---- Clean up temp files ----
-rm -rf "$TMP_DIR"
-
-# ---- Final sanity prints ----
-echo
-echo "========= READY ========="
-echo "Root tools dir: $ROOT_DIR"
-echo "Binaries linked under: $BIN_DIR"
-echo "If pipx was newly installed, add to PATH for this session:"
-echo '  export PATH="$HOME/.local/bin:$PATH"'
-echo
-echo "Quick checks:"
-echo "  which impacket-smbclient || true"
-echo "  which bloodhound-python || true"
-echo "  which mitm6 || true"
-echo "  which responder || true"
-echo "  which chisel || true"
-echo "  which ligolo-proxy || true"
-echo "  which sliver-server || true"
-echo "=========================="
+title "Done"
+ok "Minimal toolkit ready. Log: $LOG"
+echo -e "${B}Try:${N} impacket-smbclient, bloodhound-python, mitm6, responder."
